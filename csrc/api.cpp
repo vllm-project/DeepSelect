@@ -238,14 +238,22 @@ STABLE_TORCH_LIBRARY_IMPL(deep_select, CompositeExplicitAutograd, m) {
     m.impl("get_alignment_requirement", TORCH_BOX(&get_alignment_requirement));
 }
 
+// The module/init names follow TORCH_EXTENSION_NAME (defined by the build
+// system, e.g. deep_select_cuda for the standalone package, _deepselect_C
+// when built inside vLLM).
+#define _DS_CONCAT_IMPL(A, B) A##B
+#define _DS_CONCAT(A, B) _DS_CONCAT_IMPL(A, B)
+#define _DS_STRINGIFY_IMPL(A) #A
+#define _DS_STRINGIFY(A) _DS_STRINGIFY_IMPL(A)
+
 static struct PyModuleDef deep_select_cuda_module = {
     PyModuleDef_HEAD_INIT,
-    "deep_select_cuda",
+    _DS_STRINGIFY(TORCH_EXTENSION_NAME),
     nullptr,
     -1,
     nullptr,
 };
 
-PyMODINIT_FUNC PyInit_deep_select_cuda(void) {
+PyMODINIT_FUNC _DS_CONCAT(PyInit_, TORCH_EXTENSION_NAME)(void) {
     return PyModule_Create(&deep_select_cuda_module);
 }
