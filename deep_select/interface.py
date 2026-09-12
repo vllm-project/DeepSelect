@@ -3,7 +3,9 @@ import torch
 
 from typing import Optional, Tuple
 
-from . import deep_select_cuda as _backend
+# Importing the extension module registers the `deep_select` torch library ops
+# (the extension is built against the PyTorch stable ABI).
+from . import deep_select_cuda as _backend  # noqa: F401
 
 
 @functools.lru_cache(maxsize=1)
@@ -11,7 +13,7 @@ def get_stride_requirement() -> Tuple[int, int]:
     """
     Returns the stride requirement for input / output tensors, in bytes
     """
-    return _backend.get_alignment_requirement()
+    return torch.ops.deep_select.get_alignment_requirement()
 
 
 def topk(
@@ -87,5 +89,5 @@ def topk(
         return_value,
         abort_when_nan_found,
     )
-    _backend.topk(*backend_args)
+    torch.ops.deep_select.topk(*backend_args)
     return output_val, output_idx

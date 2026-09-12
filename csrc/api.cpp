@@ -1,81 +1,95 @@
-// This file contains only the host-side topk() function and pybind11 module.
+// This file contains only the host-side topk() function, torch library registration
+// (stable ABI) and the Python module init.
 // Kernel template instantiations are in separate files for parallel compilation.
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDAEvent.h>
+#include <Python.h>
 
-#include "kerutils/supplemental/torch_tensors.h"
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/shim_utils.h>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime_api.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <format>
+#include <optional>
+#include <tuple>
 
 #include "dispatch_utils.h"
+#include "stable_tensor_checks.h"
 
 #include "cuda_kernels/config.h"
 #include "cuda_kernels/v3/topk_select.h"
 #include "cuda_kernels/v3_fp32/topk_select.h"
-#include <cstdlib>
 #include "cuda_kernels/v3_cluster/topk_select.h"
 
+using deep_select::Tensor;
+
 void topk(
-    torch::Tensor &input,
-    int topk,
-    c10::optional<torch::Tensor> &begin,
-    c10::optional<torch::Tensor> &end,
+    const Tensor& input,
+    int64_t topk,
+    const std::optional<Tensor>& begin,
+    const std::optional<Tensor>& end,
     bool sorted_value,
     bool sorted_index,
-    c10::optional<torch::Tensor> &output_value,
-    torch::Tensor &output_index,
-    c10::optional<torch::Tensor> &output_idx_offset,
-    int idx_oob_fill_value,
-    float value_oob_fill_value,
+    const std::optional<Tensor>& output_value,
+    const Tensor& output_index,
+    const std::optional<Tensor>& output_idx_offset,
+    int64_t idx_oob_fill_value,
+    double value_oob_fill_value,
     bool return_value,
     bool abort_when_nan_found
 ) {
-    int batch_size = input.size(0);
-    int vocab_size = input.size(1);
-    at::ScalarType value_t = input.scalar_type();
-    at::ScalarType output_index_t = output_index.scalar_type();
+    int64_t batch_size = input.size(0);
+    int64_t vocab_size = input.size(1);
+    ScalarType value_t = input.scalar_type();
+    ScalarType output_index_t = output_index.scalar_type();
 
-    TORCH_CHECK(topk > 0, "topk must > 0");
-    TORCH_CHECK(!(sorted_value && !return_value), "`return_value` must be enabled when `sorted_value` is True");
-    TORCH_CHECK(!(sorted_value && sorted_index), "`sorted_value` and `sorted_index` cannot be used at the same time");
+    STD_TORCH_CHECK(topk > 0, "topk must > 0");
+    STD_TORCH_CHECK(!(sorted_value && !return_value), "`return_value` must be enabled when `sorted_value` is True");
+    STD_TORCH_CHECK(!(sorted_value && sorted_index), "`sorted_value` and `sorted_index` cannot be used at the same time");
     // Contract: sorted_value is a 32-bit-value-only feature.
-    TORCH_CHECK(!(sorted_value && value_t == at::kBFloat16), "`sorted_value` is only supported for float32 input");
-    TORCH_CHECK(!begin.has_value(), "`begin` is not supported currently");
+    STD_TORCH_CHECK(!(sorted_value && value_t == ScalarType::BFloat16), "`sorted_value` is only supported for float32 input");
+    STD_TORCH_CHECK(!begin.has_value(), "`begin` is not supported currently");
     if (return_value) {
-        TORCH_CHECK(output_value.has_value(), "`output_value` must not be `None` when `return_value` is True");
+        STD_TORCH_CHECK(output_value.has_value(), "`output_value` must not be `None` when `return_value` is True");
     }
-    
-    KU_CHECK_DEVICE(input);
-    KU_CHECK_DEVICE(begin);
-    KU_CHECK_DEVICE(end);
-    KU_CHECK_DEVICE(output_value);
-    KU_CHECK_DEVICE(output_index);
-    KU_CHECK_DEVICE(output_idx_offset);
-    
-    KU_CHECK_SHAPE(input, batch_size, vocab_size);
-    KU_CHECK_SHAPE(begin, batch_size);
-    KU_CHECK_SHAPE(end, batch_size);
-    KU_CHECK_SHAPE(output_value, batch_size, topk);
-    KU_CHECK_SHAPE(output_index, batch_size, topk);
-    KU_CHECK_SHAPE(output_idx_offset, batch_size);
-    
-    KU_CHECK_DTYPE(input, value_t);
-    KU_CHECK_DTYPE(begin, at::kInt);
-    KU_CHECK_DTYPE(end, at::kInt);
-    KU_CHECK_DTYPE(output_value, value_t);
-    KU_CHECK_DTYPE(output_index, output_index_t);
-    KU_CHECK_DTYPE(output_idx_offset, at::kInt);
-    
-    KU_CHECK_LAST_DIM_CONTIGUOUS(input);
-    KU_CHECK_CONTIGUOUS(begin);
-    KU_CHECK_CONTIGUOUS(end);
-    KU_CHECK_LAST_DIM_CONTIGUOUS(output_value);
-    KU_CHECK_LAST_DIM_CONTIGUOUS(output_index);
-    KU_CHECK_CONTIGUOUS(output_idx_offset);
 
-    auto check_dim0_stride = [&](const char tensor_name[], torch::Tensor &tensor, uint32_t alignment_requirement_bytes) {
+    DS_CHECK_DEVICE(input);
+    DS_CHECK_DEVICE(begin);
+    DS_CHECK_DEVICE(end);
+    DS_CHECK_DEVICE(output_value);
+    DS_CHECK_DEVICE(output_index);
+    DS_CHECK_DEVICE(output_idx_offset);
+
+    DS_CHECK_SHAPE(input, batch_size, vocab_size);
+    DS_CHECK_SHAPE(begin, batch_size);
+    DS_CHECK_SHAPE(end, batch_size);
+    DS_CHECK_SHAPE(output_value, batch_size, topk);
+    DS_CHECK_SHAPE(output_index, batch_size, topk);
+    DS_CHECK_SHAPE(output_idx_offset, batch_size);
+
+    DS_CHECK_DTYPE(input, value_t);
+    DS_CHECK_DTYPE(begin, ScalarType::Int);
+    DS_CHECK_DTYPE(end, ScalarType::Int);
+    DS_CHECK_DTYPE(output_value, value_t);
+    DS_CHECK_DTYPE(output_index, output_index_t);
+    DS_CHECK_DTYPE(output_idx_offset, ScalarType::Int);
+
+    DS_CHECK_LAST_DIM_CONTIGUOUS(input);
+    DS_CHECK_CONTIGUOUS(begin);
+    DS_CHECK_CONTIGUOUS(end);
+    DS_CHECK_LAST_DIM_CONTIGUOUS(output_value);
+    DS_CHECK_LAST_DIM_CONTIGUOUS(output_index);
+    DS_CHECK_CONTIGUOUS(output_idx_offset);
+
+    auto check_dim0_stride = [&](const char tensor_name[], const Tensor& tensor, uint32_t alignment_requirement_bytes) {
         int64_t cur_stride = tensor.stride(0);
-        uint64_t itemsize = tensor.dtype().itemsize();
-        TORCH_CHECK(cur_stride * itemsize % alignment_requirement_bytes == 0,
+        uint64_t itemsize = tensor.element_size();
+        STD_TORCH_CHECK(cur_stride * itemsize % alignment_requirement_bytes == 0,
             std::format("{}.stride(0) (currently {} numbers) must be a multiple of {} Bytes ({} numbers)",
                 tensor_name, cur_stride,
                 alignment_requirement_bytes, alignment_requirement_bytes / itemsize
@@ -88,19 +102,27 @@ void topk(
         check_dim0_stride("value", *output_value, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT);
     }
 
-    cudaDeviceProp* device_prop = at::cuda::getDeviceProperties(at::cuda::current_device());
-    TORCH_CHECK(device_prop != nullptr);
+    torch::stable::accelerator::DeviceIndex device_index = input.get_device_index();
+    torch::stable::accelerator::DeviceGuard device_guard(device_index);
+
+    cudaDeviceProp device_prop;
+    STD_TORCH_CHECK(cudaGetDeviceProperties(&device_prop, device_index) == cudaSuccess,
+                    "failed to get CUDA device properties");
+
+    void* stream_ptr = nullptr;
+    TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &stream_ptr));
+
     TopkSelectArgs args = {
         (uint32_t)batch_size,
         (uint32_t)vocab_size,
         (uint32_t)topk,
 
         input.data_ptr(),
-        ku::get_optional_tensor_ptr<void>(output_value),
+        deep_select::get_optional_tensor_ptr<void>(output_value),
         output_index.data_ptr(),
-        ku::get_optional_tensor_ptr<int>(begin),
-        ku::get_optional_tensor_ptr<int>(end),
-        ku::get_optional_tensor_ptr<int>(output_idx_offset),
+        deep_select::get_optional_tensor_ptr<int>(begin),
+        deep_select::get_optional_tensor_ptr<int>(end),
+        deep_select::get_optional_tensor_ptr<int>(output_idx_offset),
 
         (uint64_t)input.stride(0),
         output_value.has_value() ? (uint64_t)output_value->stride(0) : 0,
@@ -109,22 +131,22 @@ void topk(
         sorted_value,
         sorted_index,
         return_value,
-        idx_oob_fill_value,
-        value_oob_fill_value,
+        (int)idx_oob_fill_value,
+        (float)value_oob_fill_value,
         abort_when_nan_found,
 
-        device_prop->sharedMemPerBlockOptin,
-        at::cuda::getCurrentCUDAStream().stream()
+        device_prop.sharedMemPerBlockOptin,
+        static_cast<cudaStream_t>(stream_ptr)
     };
 
-    uint32_t num_sm = device_prop->multiProcessorCount;
+    uint32_t num_sm = device_prop.multiProcessorCount;
     uint32_t num_waves = (batch_size + num_sm-1) / num_sm;
 
-    TORCH_CHECK(value_t == at::kBFloat16 || value_t == at::kFloat, "input dtype must be bfloat16 or float32");
-    if (value_t == at::kBFloat16) {
-        TORCH_CHECK((uint32_t)vocab_size < MAX_VOCAB_SIZE,
+    STD_TORCH_CHECK(value_t == ScalarType::BFloat16 || value_t == ScalarType::Float, "input dtype must be bfloat16 or float32");
+    if (value_t == ScalarType::BFloat16) {
+        STD_TORCH_CHECK((uint32_t)vocab_size < MAX_VOCAB_SIZE,
                     "vocab_size must be < 2^23 for bfloat16 input");
-        TORCH_CHECK(topk <= 4096, "topk must be <= 4096");
+        STD_TORCH_CHECK(topk <= 4096, "topk must be <= 4096");
         if (batch_size <= 6 && (uint32_t)vocab_size >= 512u * 1024u && topk <= 1024) {  // TODO Tune
             INTEGER_TYPE_SWITCH(output_index_t, OutIdxT, [&]() {
                 BOOL_SWITCH(sorted_index, SORTED_INDEX, [&]() {
@@ -162,9 +184,9 @@ void topk(
             });
         }
     } else {
-        TORCH_CHECK((uint32_t)vocab_size < MAX_VOCAB_SIZE,
+        STD_TORCH_CHECK((uint32_t)vocab_size < MAX_VOCAB_SIZE,
                     "vocab_size must be < 2^23 for float32 input");
-        TORCH_CHECK(topk <= 4096, "topk must be <= 4096");
+        STD_TORCH_CHECK(topk <= 4096, "topk must be <= 4096");
 
         INTEGER_TYPE_SWITCH(output_index_t, OutIdxT, [&]() {
             //   topk <= 1024        -> 512t / B8192 / B2 4096 / TMA3
@@ -194,11 +216,36 @@ void topk(
     }
 }
 
-std::pair<uint32_t, uint32_t> get_alignment_requirement() {
+std::tuple<int64_t, int64_t> get_alignment_requirement() {
     return {INPUT_STRIDE_ALIGNMENT_REQUIREMENT, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT};
-
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("topk", &topk);
-    m.def("get_alignment_requirement", &get_alignment_requirement);
+
+STABLE_TORCH_LIBRARY(deep_select, m) {
+    m.def(
+        "topk(Tensor input, int topk, Tensor? begin, Tensor? end, "
+        "bool sorted_value, bool sorted_index, "
+        "Tensor(a!)? output_value, Tensor(b!) output_index, Tensor? output_idx_offset, "
+        "int idx_oob_fill_value, float value_oob_fill_value, "
+        "bool return_value, bool abort_when_nan_found) -> ()");
+    m.def("get_alignment_requirement() -> (int, int)");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(deep_select, CUDA, m) {
+    m.impl("topk", TORCH_BOX(&topk));
+}
+
+STABLE_TORCH_LIBRARY_IMPL(deep_select, CompositeExplicitAutograd, m) {
+    m.impl("get_alignment_requirement", TORCH_BOX(&get_alignment_requirement));
+}
+
+static struct PyModuleDef deep_select_cuda_module = {
+    PyModuleDef_HEAD_INIT,
+    "deep_select_cuda",
+    nullptr,
+    -1,
+    nullptr,
+};
+
+PyMODINIT_FUNC PyInit_deep_select_cuda(void) {
+    return PyModule_Create(&deep_select_cuda_module);
 }

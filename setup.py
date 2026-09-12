@@ -131,11 +131,15 @@ def build_on_cuda_platform():
     ext_modules = [CUDAExtension(
         name="deep_select.deep_select_cuda",
         sources=CUDA_SOURCES,
+        py_limited_api=True,
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations", "-DKERUTILS_IS_BUILD_ON_CUDA"],
+            # Target the torch 2.10 stable ABI (minimum supported torch version)
+            "cxx": ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations", "-DTORCH_TARGET_VERSION=0x020a000000000000", "-DUSE_CUDA"],
             "nvcc": append_nvcc_threads([
                 "-O3",
                 "-std=c++20",
+                "-DTORCH_TARGET_VERSION=0x020a000000000000",
+                "-DUSE_CUDA",
                 "-Wno-deprecated-declarations",
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -215,5 +219,6 @@ setup(
     packages=find_packages(include=['deep_select']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
     zip_safe=False,
 )

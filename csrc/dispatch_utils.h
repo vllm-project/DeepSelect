@@ -4,7 +4,10 @@
  */
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/util/Exception.h>
+
+using torch::headeronly::ScalarType;
 
 #define BOOL_SWITCH(COND, CONST_NAME, ...)      \
   [&] {                                         \
@@ -19,29 +22,29 @@
 
 #define INTEGER_TYPE_SWITCH(type, INDEX_TYPE, ...)   \
   [&] {                                              \
-    if (type == torch::kLong) {                      \
+    if (type == ScalarType::Long) {                  \
       using INDEX_TYPE = int64_t;                    \
       return __VA_ARGS__();                          \
-    } else if(type == torch::kInt32) {               \
+    } else if(type == ScalarType::Int) {             \
       using INDEX_TYPE = int32_t;                    \
       return __VA_ARGS__();                          \
     } else {                                         \
-      TORCH_CHECK(                                   \
-        false, "Unsupported integer dtype: ", type);                 \
+      STD_TORCH_CHECK(                               \
+        false, "Unsupported integer dtype");                     \
     }                                                \
   }()
 
 #define FLOATING_TYPE_SWITCH(type, FP_TYPE, ...)        \
   [&] {                                                 \
-    if (type == at::ScalarType::Float) {                \
+    if (type == ScalarType::Float) {                    \
       using FP_TYPE = float;                            \
       return __VA_ARGS__();                             \
-    } else if (type == at::ScalarType::BFloat16) {      \
+    } else if (type == ScalarType::BFloat16) {          \
       using FP_TYPE = nv_bfloat16;                      \
       return __VA_ARGS__();                             \
     } else {                                            \
-      TORCH_CHECK(                                      \
-        false, "Unsupported floating point dtype: ", type);                    \
+      STD_TORCH_CHECK(                                  \
+        false, "Unsupported floating point dtype");                       \
     }                                                   \
   }()
 
@@ -60,7 +63,7 @@
       constexpr static int CLUSTER_SIZE = 8;                     \
       return __VA_ARGS__();                                      \
     } else {                                                     \
-      TORCH_CHECK(                                               \
+      STD_TORCH_CHECK(                                           \
         false, "Unsupported cluster_size");                      \
     }                                                            \
   }()
