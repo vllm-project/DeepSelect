@@ -35,21 +35,35 @@ def topk(
     """
     Arguments:
         input: (b, vocab_size), dtype=torch.bfloat16/torch.float. stride(0) must be a multiple of `deep_select.get_stride_requirement()[0]` bytes, and stride(1) must be 1.
-        topk: int. Select topk elements for each row.
-        sorted: bool. Whether to return sorted **output_val**. Only supports fp32.
+               b must fit int32 and 0 <= vocab_size < 2**23. SM100/SM103 require vocab_size > 0 when b > 0;
+               SM120/SM121 support zero-width rows. Empty batches remain supported on all compiled targets.
+               Nonempty backing storage must include the final row padded to 128 bytes.
+        topk: int, 1 <= topk <= 4096. Select topk elements for each row.
+        sorted: bool. Whether to return sorted **output_val**. Only supports fp32, requires return_value, and excludes sorted_index.
         begin(optional): (b,), dtype=int32. CURRENTLY NOT SUPPORTED. The left(inclusive) range for input row, default is 0.
         end(optional): (b,), dtype=int32. The right(exclusive) range for input row, default is vocab_size. The stride of this tensor must be 1.
                        Note when end[i] <= topk, valid elements will be gathered at the beginning of values and indices returned. The rest of `values` will be filled with `value_oob_fill_value`, while the rest of `indices` will be filled with `idx_oob_fill_value` (won't be plused by `output_idx_offset`).
-                       `end` <= `vocab_size` must be held
+                       The caller must ensure 0 <= end[i] <= vocab_size; host validation does not read CUDA tensor contents.
         indices_type: torch.dtype. The output indices dtype, only support torch.int32 and torch.int64.
         sorted_index: bool. Whether to return sorted **output_idx**.
         hint(optional): CURRENTLY NOT SUPPORTED
-        output_idx(optional): (b, topk), dtype=indices_type. A contiguous tensor to store output.
+        output_idx(optional): (b, topk), dtype=indices_type. Last dimension contiguous, row stride aligned to 32 bytes, with nonoverlapping rows.
         output_idx_offset(optional): (b,), dtype=int32. If provided, all output_idx (`idx_oob_fill_value` not included) will += output_idx_offset.
-        idx_oob_fill_value: int. See comments above when end[i]-begin[i]<topk.
+        idx_oob_fill_value: int32-representable int. See comments above when end[i]-begin[i]<topk.
+        value_oob_fill_value: float32-representable finite value, infinity, or NaN. Used for short-row padding.
         return_value: bool. If False, only return indices without values to accelerate the kernel. The return value is still a Tuple, but the first element will be None.
         abort_when_nan_found: bool. When a NaN is found, if True, aborts the whole kernel; if False, writes 0x3F3F3F3F to the corresponding output_idx[batch_idx][0] and exits.
                 The NaN check itself is always enabled. Exception: when the row's length <= topk, it is skipped.
+
+    Contract:
+        All tensors must be on input's CUDA device. Input and output pointers must be 32-byte aligned.
+        Neither output may share or overlap backing storage with input, end, output_idx_offset, or the other output,
+        even through disjoint views; a pair containing an empty tensor is exempt from this alias check.
+        These checks also apply to direct torch.ops.deep_select.topk calls and supplied output_value when return_value=False.
+        Native kernels run on the current PyTorch CUDA stream, including SM120/SM121 segmented selection with int32 workspace (b, 8, 1025).
+        CUDA capabilities 12.0 and 12.1 use the same native algorithms, each enabled only when its exact target was compiled.
+        Other 12.x capabilities are rejected. SM121 hardware validation is still required.
+        Only compiled CUDA targets are supported; there is no torch.topk fallback.
 
     Return:
         output_val: (b, topk), dtype=input.dtype.

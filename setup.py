@@ -99,6 +99,7 @@ CUDA_SOURCES = [
 
 def build_on_cuda_platform():
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+    from csrc.build_utils import build_plan, grouped_build_extension, parse_cuda_arch_list
 
     assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
 
@@ -113,24 +114,17 @@ def build_on_cuda_platform():
     nvcc_version_number = nvcc_version.split("release ")[1].split(",")[0].strip()
     major, minor = map(int, nvcc_version_number.split("."))
     print(f"Compiling using NVCC {major}.{minor}")
-    if major < 12 or (major == 12 and minor <= 8):
-        raise RuntimeError("sm100 compilation requires NVCC 12.9 or higher.")
-
-    cc_flag = [
-        # Currently skip build for sm80 and sm90 to speed up compilation
-        # "-gencode", "arch=compute_80,code=sm_80",
-        # "-gencode", "arch=compute_90a,code=sm_90a",
-
-        # Compile sm100 and sm103 separately to give the compiler more room for optimization
-        "-gencode", "arch=compute_100a,code=sm_100a",
-        "-gencode", "arch=compute_103a,code=sm_103a",
-    ]
+    architectures = parse_cuda_arch_list(
+        os.getenv("DEEP_SELECT_CUDA_ARCH_LIST"), (major, minor)
+    )
+    sources, macros, group_flags = build_plan(CUDA_SOURCES, architectures)
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
 
     ext_modules = [CUDAExtension(
         name="deep_select.deep_select_cuda",
-        sources=CUDA_SOURCES,
+        sources=sources,
+        define_macros=macros,
         py_limited_api=True,
         extra_compile_args={
             # Target the torch 2.10 stable ABI (minimum supported torch version)
@@ -152,7 +146,7 @@ def build_on_cuda_platform():
                 "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-double-precision-use",
                 "-lineinfo",
                 "--source-in-ptx",
-            ] + cc_flag)
+            ])
         },
         include_dirs=[
             Path(this_dir) / "csrc",
@@ -168,7 +162,7 @@ def build_on_cuda_platform():
         ],
     )]
 
-    class SpillCheckBuildExtension(BuildExtension):
+    class SpillCheckBuildExtension(grouped_build_extension(BuildExtension, group_flags)):
         STACK_BASELINE = 8  # Because of we're using `printf`
 
         def run(self):

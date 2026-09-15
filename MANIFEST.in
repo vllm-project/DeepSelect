@@ -1,0 +1,11 @@
+include setup.py
+include csrc/*.cpp csrc/*.h csrc/build_utils.py
+recursive-include csrc/cuda_kernels *.cu *.cuh *.h *.hpp *.inl
+recursive-include csrc/3rdparty/cutlass/include *
+include csrc/3rdparty/cutlass/LICENSE.txt
+recursive-include csrc/3rdparty/kerutils/include *
+include csrc/3rdparty/kerutils/README.md
+include tests/__init__.py tests/test_build_plan.py
+recursive-include tests/kernelkit *.py
+include scripts/generate_instantiations.py
+global-exclude __pycache__ *.py[cod]

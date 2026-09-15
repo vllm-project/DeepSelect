@@ -2,6 +2,7 @@ import os
 import subprocess
 import re
 import sys
+import shutil
 from typing import List, Optional
 
 from .platform import Platform, requires_platform, get_current_platform
@@ -33,9 +34,10 @@ def check_kernel_reg_spill_in_artifact(artifact_path: str, stack_baseline: int =
         print(f"Checking register spills in: {artifact_path}")
 
     cuda_home = CUDA_HOME if CUDA_HOME is not None else '/usr/local/cuda'
-    cuobjdump_path = os.path.join(cuda_home, 'bin/cuobjdump')
-    if not os.path.exists(cuobjdump_path):
-        raise FileNotFoundError(f"cuobjdump not found (looked at {cuobjdump_path})")
+    toolkit_cuobjdump = os.path.join(cuda_home, 'bin/cuobjdump')
+    cuobjdump_path = shutil.which(toolkit_cuobjdump) or shutil.which('cuobjdump')
+    if cuobjdump_path is None:
+        raise FileNotFoundError(f"cuobjdump not found (looked at {toolkit_cuobjdump} and PATH)")
     
     try:
         result = subprocess.run(

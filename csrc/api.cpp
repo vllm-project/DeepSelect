@@ -5,28 +5,48 @@
 
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor.h>
 #include <torch/headeronly/util/Exception.h>
 #include <torch/headeronly/util/shim_utils.h>
 
-#include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 
+#include <climits>
+#include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <format>
+#include <limits>
 #include <optional>
 #include <tuple>
 
-#include "dispatch_utils.h"
 #include "stable_tensor_checks.h"
+#include "structs.h"
 
+#ifndef DEEP_SELECT_BUILD_SM100
+#define DEEP_SELECT_BUILD_SM100 1
+#endif
+#ifndef DEEP_SELECT_BUILD_SM120
+#define DEEP_SELECT_BUILD_SM120 0
+#endif
+#ifndef DEEP_SELECT_BUILD_SM121
+#define DEEP_SELECT_BUILD_SM121 0
+#endif
+
+#if DEEP_SELECT_BUILD_SM100
+#include <cuda_bf16.h>
+#include "dispatch_utils.h"
 #include "cuda_kernels/config.h"
 #include "cuda_kernels/v3/topk_select.h"
 #include "cuda_kernels/v3_fp32/topk_select.h"
 #include "cuda_kernels/v3_cluster/topk_select.h"
+#endif
+#if DEEP_SELECT_BUILD_SM120 || DEEP_SELECT_BUILD_SM121
+#include "cuda_kernels/sm120/topk_select.h"
+#endif
 
 using deep_select::Tensor;
+using torch::headeronly::ScalarType;
 
 void topk(
     const Tensor& input,
@@ -43,15 +63,22 @@ void topk(
     bool return_value,
     bool abort_when_nan_found
 ) {
-    int64_t batch_size = input.size(0);
-    int64_t vocab_size = input.size(1);
-    ScalarType value_t = input.scalar_type();
-    ScalarType output_index_t = output_index.scalar_type();
+    STD_TORCH_CHECK(input.dim() == 2, "input must have two dimensions");
+    const int64_t batch_size = input.size(0);
+    const int64_t vocab_size = input.size(1);
+    const ScalarType value_t = input.scalar_type();
+    const ScalarType output_index_t = output_index.scalar_type();
 
-    STD_TORCH_CHECK(topk > 0, "topk must > 0");
+    STD_TORCH_CHECK(batch_size >= 0 && batch_size <= INT32_MAX, "batch_size must fit int32");
+    STD_TORCH_CHECK(vocab_size >= 0 && vocab_size < MAX_VOCAB_SIZE, "vocab_size must be < 2^23");
+    STD_TORCH_CHECK(topk > 0 && topk <= 4096, "topk must be > 0 and <= 4096");
+    STD_TORCH_CHECK(value_t == ScalarType::BFloat16 || value_t == ScalarType::Float, "input dtype must be bfloat16 or float32");
+    STD_TORCH_CHECK(output_index_t == ScalarType::Int || output_index_t == ScalarType::Long, "indices dtype must be int32 or int64");
+    STD_TORCH_CHECK(idx_oob_fill_value >= INT32_MIN && idx_oob_fill_value <= INT32_MAX, "idx_oob_fill_value must fit int32");
+    STD_TORCH_CHECK(!std::isfinite(value_oob_fill_value) || std::abs(value_oob_fill_value) <= std::numeric_limits<float>::max(),
+                    "finite value_oob_fill_value must fit float32");
     STD_TORCH_CHECK(!(sorted_value && !return_value), "`return_value` must be enabled when `sorted_value` is True");
     STD_TORCH_CHECK(!(sorted_value && sorted_index), "`sorted_value` and `sorted_index` cannot be used at the same time");
-    // Contract: sorted_value is a 32-bit-value-only feature.
     STD_TORCH_CHECK(!(sorted_value && value_t == ScalarType::BFloat16), "`sorted_value` is only supported for float32 input");
     STD_TORCH_CHECK(!begin.has_value(), "`begin` is not supported currently");
     if (return_value) {
@@ -59,11 +86,17 @@ void topk(
     }
 
     DS_CHECK_DEVICE(input);
-    DS_CHECK_DEVICE(begin);
-    DS_CHECK_DEVICE(end);
-    DS_CHECK_DEVICE(output_value);
-    DS_CHECK_DEVICE(output_index);
-    DS_CHECK_DEVICE(output_idx_offset);
+    const auto device_index = input.get_device_index();
+    auto check_device = [&](const char* name, const auto& tensor) {
+        STD_TORCH_CHECK(deep_select::_check_optional_tensor(tensor, [&](const Tensor& t) {
+            return t.is_cuda() && t.get_device_index() == device_index;
+        }), "`", name, "` must be on the same CUDA device as `input`");
+    };
+    check_device("begin", begin);
+    check_device("end", end);
+    check_device("output_value", output_value);
+    check_device("output_index", output_index);
+    check_device("output_idx_offset", output_idx_offset);
 
     DS_CHECK_SHAPE(input, batch_size, vocab_size);
     DS_CHECK_SHAPE(begin, batch_size);
@@ -72,11 +105,9 @@ void topk(
     DS_CHECK_SHAPE(output_index, batch_size, topk);
     DS_CHECK_SHAPE(output_idx_offset, batch_size);
 
-    DS_CHECK_DTYPE(input, value_t);
     DS_CHECK_DTYPE(begin, ScalarType::Int);
     DS_CHECK_DTYPE(end, ScalarType::Int);
     DS_CHECK_DTYPE(output_value, value_t);
-    DS_CHECK_DTYPE(output_index, output_index_t);
     DS_CHECK_DTYPE(output_idx_offset, ScalarType::Int);
 
     DS_CHECK_LAST_DIM_CONTIGUOUS(input);
@@ -87,27 +118,52 @@ void topk(
     DS_CHECK_CONTIGUOUS(output_idx_offset);
 
     auto check_dim0_stride = [&](const char tensor_name[], const Tensor& tensor, uint32_t alignment_requirement_bytes) {
-        int64_t cur_stride = tensor.stride(0);
-        uint64_t itemsize = tensor.element_size();
-        STD_TORCH_CHECK(cur_stride * itemsize % alignment_requirement_bytes == 0,
+        const int64_t cur_stride = tensor.stride(0);
+        const uint64_t itemsize = tensor.element_size();
+        STD_TORCH_CHECK(cur_stride >= 0, tensor_name, ".stride(0) must be nonnegative");
+        STD_TORCH_CHECK(deep_select::checked_mul(cur_stride, itemsize) % alignment_requirement_bytes == 0,
             std::format("{}.stride(0) (currently {} numbers) must be a multiple of {} Bytes ({} numbers)",
                 tensor_name, cur_stride,
                 alignment_requirement_bytes, alignment_requirement_bytes / itemsize
             )
         );
+        deep_select::check_pointer_alignment(tensor_name, tensor);
     };
     check_dim0_stride("input", input, INPUT_STRIDE_ALIGNMENT_REQUIREMENT);
     check_dim0_stride("output_index", output_index, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT);
     if (output_value.has_value()) {
-        check_dim0_stride("value", *output_value, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT);
+        check_dim0_stride("output_value", *output_value, OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT);
+    }
+    deep_select::check_storage_bounds("input", input, 128);
+    if (end.has_value()) deep_select::check_storage_bounds("end", *end);
+    if (output_idx_offset.has_value()) deep_select::check_storage_bounds("output_idx_offset", *output_idx_offset);
+    auto check_output = [&](const char* name, const Tensor& output) {
+        STD_TORCH_CHECK(batch_size <= 1 || output.stride(0) >= topk, name, " rows must not overlap");
+        deep_select::check_storage_bounds(name, output);
+        deep_select::check_storage_disjoint(name, output, "input", input);
+        if (end.has_value()) deep_select::check_storage_disjoint(name, output, "end", *end);
+        if (output_idx_offset.has_value()) deep_select::check_storage_disjoint(name, output, "output_idx_offset", *output_idx_offset);
+    };
+    check_output("output_index", output_index);
+    if (output_value.has_value()) {
+        check_output("output_value", *output_value);
+        deep_select::check_storage_disjoint("output_index", output_index, "output_value", *output_value);
     }
 
-    torch::stable::accelerator::DeviceIndex device_index = input.get_device_index();
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
-
     cudaDeviceProp device_prop;
     STD_TORCH_CHECK(cudaGetDeviceProperties(&device_prop, device_index) == cudaSuccess,
                     "failed to get CUDA device properties");
+    const bool use_sm100 = DEEP_SELECT_BUILD_SM100 && device_prop.major == 10;
+    const bool use_native_sm12 = device_prop.major == 12 &&
+        ((DEEP_SELECT_BUILD_SM120 && device_prop.minor == 0) ||
+         (DEEP_SELECT_BUILD_SM121 && device_prop.minor == 1));
+    STD_TORCH_CHECK(use_sm100 || use_native_sm12, "DeepSelect was not built for this CUDA capability: ",
+                    device_prop.major, ".", device_prop.minor);
+    if (batch_size == 0) return;
+    STD_TORCH_CHECK(!use_sm100 || vocab_size > 0,
+                    "SM100/SM103 require vocab_size > 0 for nonempty batches");
+    STD_TORCH_CHECK(batch_size <= device_prop.maxGridSize[0], "batch_size exceeds the CUDA grid limit");
 
     void* stream_ptr = nullptr;
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &stream_ptr));
@@ -139,6 +195,29 @@ void topk(
         static_cast<cudaStream_t>(stream_ptr)
     };
 
+#if DEEP_SELECT_BUILD_SM120 || DEEP_SELECT_BUILD_SM121
+    if (use_native_sm12) {
+        const bool segmented = topk_select_sm120::use_segmented_topk(args, output_index_t == ScalarType::Long);
+        if (segmented) {
+            const uint64_t blocks = deep_select::checked_mul(batch_size, topk_select_sm120::SEGMENTED_PARTITIONS);
+            STD_TORCH_CHECK(blocks <= static_cast<uint64_t>(device_prop.maxGridSize[0]),
+                            "segmented batch_size exceeds the CUDA grid limit");
+            const uint64_t workspace_elements = deep_select::checked_mul(blocks, topk_select_sm120::SEGMENTED_WORKSPACE_STRIDE);
+            STD_TORCH_CHECK(workspace_elements <= UINT32_MAX, "segmented workspace indexing exceeds uint32");
+            deep_select::checked_mul(workspace_elements, sizeof(int32_t));
+            auto workspace = torch::stable::empty(
+                {batch_size, topk_select_sm120::SEGMENTED_PARTITIONS, topk_select_sm120::SEGMENTED_WORKSPACE_STRIDE},
+                ScalarType::Int, std::nullopt, input.device());
+            topk_select_sm120::run_segmented_topk_select_kernel(
+                args, value_t == ScalarType::BFloat16, static_cast<int32_t*>(workspace.data_ptr()));
+        } else {
+            topk_select_sm120::run_topk_select_kernel(args, value_t == ScalarType::BFloat16, output_index_t == ScalarType::Long);
+        }
+        return;
+    }
+#endif
+#if DEEP_SELECT_BUILD_SM100
+    STD_TORCH_CHECK(device_prop.multiProcessorCount > 0, "CUDA device must have at least one multiprocessor");
     uint32_t num_sm = device_prop.multiProcessorCount;
     uint32_t num_waves = (batch_size + num_sm-1) / num_sm;
 
@@ -214,6 +293,7 @@ void topk(
             }
         });
     }
+#endif
 }
 
 std::tuple<int64_t, int64_t> get_alignment_requirement() {
